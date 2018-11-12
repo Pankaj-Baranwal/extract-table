@@ -1,6 +1,8 @@
+import csv
+
+from constants import DEBUG, INPUT_FILE
 from image_processing import *
 from utils import *
-from constants import DEBUG, INPUT_FILE
 
 """
 Works only when there is one single table in the PDF
@@ -19,6 +21,8 @@ CELL_POSITION_DIFFERENCE = 10
 # TODO: Should probably be wrt cell size
 PADDING_ROI_X = 5
 PADDING_ROI_Y = 5
+
+MIN_IOU = 0.8
 
 
 def generate_custom_image(table_list, img_file):
@@ -68,7 +72,7 @@ def generate_custom_image(table_list, img_file):
 
     processed = cv2.imread("4_new_image.png")
     for info in extracted_info:
-        cv2.rectangle(processed, (info[1], info[2]), (info[3], info[4]), thickness=1, color=(0, 255, 0))
+        cv2.rectangle(processed, (info[1], info[2]), (info[3], info[4]), thickness=2, color=(0, 255, 0))
         cv2.putText(processed, info[0], (info[1], info[2]), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color=(0, 0, 255))
     cv2.imwrite("5_image_with_text.png", processed)
 
@@ -116,7 +120,6 @@ def get_table_cells(image):
     x_t, y_t, w_t, h_t = cv2.boundingRect(table_contour)
 
     white_clone = get_a_white_clone(img)
-    clone2 = get_a_white_clone(img)
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
 
@@ -124,62 +127,118 @@ def get_table_cells(image):
         # Check if current contour is within table
         if x_t < x < x_t + w_t and y_t < y < y_t + h_t and curr_area > CELL_MIN_AREA:
             inner_list = [x, y, w, h]
-            cv2.rectangle(white_clone, (x, y), (x + w, y + h), thickness=1, color=(0, 0, 0))
+            cv2.rectangle(white_clone, (x, y), (x + w, y + h), thickness=2, color=(0, 0, 0))
             ret_list.append(inner_list)
 
-    cv2.imwrite("3_final_table.png", white_clone)
+    cv2.imwrite("3_table_contours.png", white_clone)
+    print(white_clone.shape, img.shape)
 
-    return ret_list,clone2
+    return ret_list, img
 
-def weak_validation(cells):
-    '''
-    Expects cells list and return cells list, 
-    removes very small contours, based on ratio of area. Where ratio 
+
+def weak_validation(cells, image):
+    """
+    Expects cells list and return cells list,
+    removes very small contours, based on ratio of area. Where ratio
     between area of contour is maximum, that is where we can think
     noise contours start
-    '''
+    """
     length = len(cells)
 
     if length < 1:
         return
 
     area_list = np.ones(len(cells))
-    k=0
+    k = 0
     for cell in cells:
-        area_list[k] = cell[2]*cell[3]
-        k=k+1
+        area_list[k] = cell[2] * cell[3]
+        k = k + 1
 
     cells = np.array(cells)
     idxs = np.argsort(area_list)
     cells = cells[idxs]
     area_list = np.sort(area_list)
-    i=0
+    i = 0
     prev_ratio = -1
     index = 0
-    while i+1<len(area_list):
-        ratio = area_list[i+1]/area_list[i]
+    while i + 1 < len(area_list):
+        ratio = area_list[i + 1] / area_list[i]
         if ratio > prev_ratio:
             prev_ratio = ratio
             index = i
-        i = i+1
+        i = i + 1
 
     if prev_ratio < 6:
         return cells
 
-    cells = cells[index+1:length,:].tolist()
+    cells = cells[index + 1:length, :].tolist()
+
+    image = get_a_white_clone(image)
+    for cell in cells:
+        cv2.rectangle(image, (cell[0], cell[1]), (cell[0] + cell[2], cell[1] + cell[3]), thickness=2, color=(0, 255, 0))
+    cv2.imwrite("4_cleaned_table.png", image)
+
     return cells
 
 
+def compare_ocr_with_cell_bboxes(cells, extracted_info):
+    """
+    Compare IoU of Vision BBoxes with extracted cells BBoxes
+    :return cells with all the text inside its perimeter [x, y, w, h, text]
+    """
+    for index, cell in enumerate(cells):
+        for info in extracted_info:
+            iou = get_intersection_ratio(info[1:], [cell[0], cell[1], cell[0] + cell[2], cell[1] + cell[3]])
+
+            if iou > MIN_IOU:
+                if len(cell) == 4:
+                    cells[index].append([info[0]])
+                else:
+                    cells[index][4].append(info[0])
+        if len(cells[index]) == 4:
+            cells[index].append("")
+        else:
+            cells[index][4] = " ".join(cells[index][4])
+
+    return cells
+
+
+def write_table_to_file(name_of_file, table):
+    with open(name_of_file, 'w+', encoding='utf8') as csvoutput:
+        writer = csv.writer(csvoutput, lineterminator='\n')
+        rows_to_write = []
+
+        for row in table:
+            row.sort(key=lambda x: x[0])
+            print(row)
+
+            new_row = []
+            for cell in row:
+                new_row.append(cell[4])
+            rows_to_write.append(new_row)
+        writer.writerows(rows_to_write)
+
+
 def main(file_to_read):
+    # pass current image to Google OCR
+    text_results = detect_text(file_to_read)
+
+    extracted_info = get_left_top_right_bottom(text_results)
+
     # Locate table in image and extract individual cells
     cells, clone = get_table_cells(file_to_read)  # [[x, y, w, h], [x, y, w, h], ...]
-    cells = weak_validation(cells)
-    for cell in cells:
-        cv2.rectangle(clone, (cell[0], cell[1]), (cell[0] + cell[2], cell[1] + cell[3]), thickness=2, color=(0, 0, 0))
-    cv2.imwrite("8_final_table.png", clone)
+    # pre-processing on table cells
+    cells = weak_validation(cells, clone)
 
+    cells_with_text = compare_ocr_with_cell_bboxes(cells, extracted_info)
 
-    #generate_custom_image(cells, file_to_read)
+    # sort cells by their top-y coordinate
+    cells_with_text.sort(key=lambda x: x[1])
+
+    # LIST WILL CONTAIN LISTS OF TEXTS WHICH ARE ON SAME LINES
+    table = sort_list(cells_with_text)
+
+    write_table_to_file("output.csv", table)
 
 
 main(INPUT_FILE)
